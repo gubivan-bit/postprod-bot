@@ -187,12 +187,29 @@ def _get_title(props: dict, key: str = "Задача") -> str:
     return parts[0]["text"]["content"] if parts else ""
 
 
+def get_project_name(thread_id: int) -> Optional[str]:
+    """Ищет проект в Notion по числовому ID топика Telegram."""
+    try:
+        res = notion.databases.query(
+            database_id=PROJECTS_DB,
+            filter={"property": "Топик ID", "number": {"equals": thread_id}},
+            page_size=1,
+        )
+        pages = res.get("results", [])
+        if not pages:
+            return None
+        return _get_title(pages[0]["properties"], "Проект")
+    except Exception as e:
+        logger.error(f"get_project_name: {e}")
+        return None
+
+
 def project_uses_hashtags(topic_name: str) -> bool:
     """Проверяет, включён ли режим обязательных #хэштегов для этой ветки."""
     try:
         res = notion.databases.query(
             database_id=PROJECTS_DB,
-            filter={"property": "Telegram топик", "rich_text": {"contains": topic_name}},
+            filter={"property": "Проект", "title": {"equals": topic_name}},
             page_size=1,
         )
         pages = res.get("results", [])
@@ -538,11 +555,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     thread_id = message.message_thread_id
 
-    # Определяем название топика
+    # Определяем название топика через Notion (по числовому ID)
     topic = "Общий"
     if message.is_topic_message and thread_id:
         fc = getattr(message, "forum_topic_created", None)
-        topic = fc.name if fc else f"Топик-{thread_id}"
+        if fc:
+            topic = fc.name
+        else:
+            # Ищем проект по Топик ID в Notion
+            notion_name = get_project_name(thread_id)
+            topic = notion_name if notion_name else f"Топик-{thread_id}"
 
     # Голосовое → транскрипция
     text = message.text or message.caption or ""
@@ -849,6 +871,26 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def cmd_topicid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Отвечает числовым ID текущего топика — для заполнения Notion."""
+    msg = update.message
+    tid = msg.message_thread_id
+    chat_id = msg.chat_id
+    if tid:
+        await msg.reply_text(
+            f"🔢 *Топик ID:* `{tid}`\n"
+            f"Chat ID: `{chat_id}`\n\n"
+            f"Вставь `{tid}` в колонку *Топик ID* этого проекта в Notion.",
+            parse_mode="Markdown",
+            message_thread_id=tid,
+        )
+    else:
+        await msg.reply_text(
+            f"ℹ️ Это не топик-тред.\nChat ID: `{chat_id}`",
+            parse_mode="Markdown",
+        )
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tid = update.message.message_thread_id
     await update.message.reply_text(
@@ -987,9 +1029,10 @@ def main() -> None:
     app.add_handler(CommandHandler("waiting",  cmd_waiting))
 
     # Инфо
-    app.add_handler(CommandHandler("report", cmd_report))
-    app.add_handler(CommandHandler("help",   cmd_help))
-    app.add_handler(CommandHandler("start",  cmd_help))
+    app.add_handler(CommandHandler("report",  cmd_report))
+    app.add_handler(CommandHandler("help",    cmd_help))
+    app.add_handler(CommandHandler("start",   cmd_help))
+    app.add_handler(CommandHandler("topicid", cmd_topicid))
 
     # Расписание
     jq: JobQueue = app.job_queue
