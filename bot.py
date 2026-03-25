@@ -607,9 +607,9 @@ def fmt_task_line(task: dict) -> str:
     episode  = _get_select(p, "Выпуск")
     assignee = _get_rich(p, "Исполнитель")
     tg_url   = p.get("Ссылка TG", {}).get("url", "")
-    ep_str   = f" · #{episode}" if episode and episode != "—" else ""
+    ep_str   = f" · #{escape_md(episode)}" if episode and episode != "—" else ""
     link     = f" [→]({tg_url})" if tg_url else ""
-    return f"  • {name} | {project}{ep_str} | {assignee}{link}"
+    return f"  • {escape_md(name)} | {escape_md(project)}{ep_str} | {escape_md(assignee)}{link}"
 
 
 def fmt_deadline_line(task: dict) -> str:
@@ -619,7 +619,7 @@ def fmt_deadline_line(task: dict) -> str:
     deadline = dl.get("start", "?")
     assignee = _get_rich(p, "Исполнитель")
     project  = _get_select(p, "Проект")
-    return f"  • {name} | {project} | {assignee} | 📅 {deadline}"
+    return f"  • {escape_md(name)} | {escape_md(project)} | {escape_md(assignee)} | 📅 {deadline}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -633,15 +633,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     thread_id = message.message_thread_id
 
     # Определяем название топика через Notion (по числовому ID)
-    topic = "Общий"
+    topic = None  # None = General, не обрабатываем
     if message.is_topic_message and thread_id:
         fc = getattr(message, "forum_topic_created", None)
         if fc:
             topic = fc.name
         else:
-            # Ищем проект по Топик ID в Notion
             notion_name = get_project_name(thread_id)
             topic = notion_name if notion_name else f"Топик-{thread_id}"
+
+    # Сообщения из General (не топик) — игнорируем, только команды
+    if not topic:
+        return
 
     # Голосовое → транскрипция
     text = message.text or message.caption or ""
@@ -1180,7 +1183,7 @@ async def handle_new_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     created    = create_project(topic_name, thread_id, chat_id)
     if created:
         await message.reply_text(
-            f"📁 Проект *{topic_name}* добавлен в Notion\n"
+            f"📁 Проект *{escape_md(topic_name)}* добавлен в Notion\n"
             f"Топик ID: `{thread_id}`",
             parse_mode="Markdown",
             message_thread_id=thread_id,
