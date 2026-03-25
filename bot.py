@@ -59,6 +59,7 @@ NOTION_TOKEN     = os.environ["NOTION_TOKEN"]
 TASKS_DB    = os.environ.get("NOTION_TASKS_DB",    "f9f3a6736e81473e8a64ff6000833119")
 PROJECTS_DB = os.environ.get("NOTION_PROJECTS_DB", "7e7b1e5c0323430cac6bc22c8f26c875")
 PATTERNS_DB = os.environ.get("NOTION_PATTERNS_DB", "01f7f279ef1442bb83f95c114bde90b0")
+DIARY_DB    = os.environ.get("NOTION_DIARY_DB",    "f0aa66009b8e4ef2b9f98d4123c94155")
 
 # Чаты куда слать дайджест/алерты (через запятую, например: -100123456,-100654321)
 DIGEST_CHAT_IDS: list[int] = [
@@ -113,7 +114,8 @@ def is_file_link(url: str) -> bool:
 # Парсинг текста
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_hashtags(text: str) -> list[str]:
-    return re.findall(r"#(\w+)", text)
+    # Поддержка точек в номерах выпусков: #ep2.1, #2.2, #серия_1.3
+    return re.findall(r"#([\w][\w.]*)", text)
 
 
 def parse_mentions(text: str) -> list[str]:
@@ -271,6 +273,8 @@ def create_task(
     deadline: Optional[str] = None,
     links: Optional[list[str]] = None,
     ai_summary: str = "",
+    chat_id: Optional[int] = None,
+    thread_id: Optional[int] = None,
 ) -> Optional[str]:
     try:
         props: dict = {
@@ -283,6 +287,10 @@ def create_task(
             "Топик TG":    {"rich_text": _rich_text(topic)},
             "Итерация правок": {"number": 0},
         }
+        if chat_id:
+            props["TG Chat ID"] = {"number": chat_id}
+        if thread_id:
+            props["TG Thread ID"] = {"number": thread_id}
         if deadline:
             props["Дедлайн"] = {"date": {"start": deadline}}
         if links:
@@ -462,6 +470,67 @@ def get_patterns_context() -> str:
     except Exception as e:
         logger.error(f"get_patterns_context: {e}")
         return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Дневник активности
+# ─────────────────────────────────────────────────────────────────────────────
+def log_event(
+    event: str,
+    project: str,
+    event_type: str,
+    episode: str = "",
+    assignee: str = "",
+    tg_link: str = "",
+) -> None:
+    """Записывает событие в базу Дневник активности в Notion."""
+    try:
+        props: dict = {
+            "Событие":    {"title": _rich_text(event[:200])},
+            "Дата":       {"date": {"start": date.today().isoformat()}},
+            "Проект":     {"rich_text": _rich_text(project)},
+            "Тип":        {"select": {"name": event_type}},
+        }
+        if episode:
+            props["Выпуск"] = {"rich_text": _rich_text(episode)}
+        if assignee:
+            props["Исполнитель"] = {"rich_text": _rich_text(assignee)}
+        if tg_link:
+            props["Ссылка TG"] = {"url": tg_link}
+        notion.pages.create(parent={"database_id": DIARY_DB}, properties=props)
+    except Exception as e:
+        logger.error(f"log_event: {e}")
+
+
+def create_project(topic_name: str, thread_id: int, chat_id: int) -> bool:
+    """Создаёт новый проект в Notion при появлении нового топика в Telegram."""
+    try:
+        # Проверяем — вдруг уже есть
+        res = notion.databases.query(
+            database_id=PROJECTS_DB,
+            filter={"property": "Топик ID", "number": {"equals": thread_id}},
+            page_size=1,
+        )
+        if res.get("results"):
+            return False  # уже существует
+        notion.pages.create(
+            parent={"database_id": PROJECTS_DB},
+            properties={
+                "Проект":         {"title": _rich_text(topic_name)},
+                "Telegram топик": {"rich_text": _rich_text(topic_name)},
+                "Топик ID":       {"number": thread_id},
+                "Статус проекта": {"select": {"name": "🟢 Активен"}},
+            },
+        )
+        log_event(
+            event=f"Новый топик: {topic_name}",
+            project=topic_name,
+            event_type="👥 Топик создан",
+        )
+        return True
+    except Exception as e:
+        logger.error(f"create_project: {e}")
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -673,6 +742,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "links":      file_links,
         "summary":    summary,
         "thread_id":  thread_id,
+        "chat_id":    message.chat_id,
     }
 
     ep_str     = f"#{episode}" if episode else "—"
@@ -723,12 +793,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             deadline  = td.get("deadline"),
             links     = td.get("links"),
             ai_summary= td.get("summary", ""),
+            chat_id   = td.get("chat_id"),
+            thread_id = td.get("thread_id"),
         )
         if page_id:
             ep = f" · #{td['episode']}" if td["episode"] else ""
             await query.edit_message_text(
                 f"✅ *Задача создана{ep}*\n_{td['task_name']}_",
                 parse_mode="Markdown",
+            )
+            # Логируем в дневник
+            log_event(
+                event=td["task_name"],
+                project=td["project"],
+                event_type="🆕 Задача создана",
+                episode=td.get("episode", ""),
+                assignee=", ".join(f"@{a}" for a in td.get("assignees", [])),
+                tg_link=td.get("tg_link", ""),
             )
         else:
             await query.edit_message_text("❌ Ошибка при создании задачи в Notion")
@@ -980,21 +1061,83 @@ async def job_morning_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def job_deadline_check(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not DIGEST_CHAT_IDS:
-        return
-    due = get_due_soon(days=1)
-    if not due:
-        return
-    lines = [f"⏰ *Дедлайн завтра — {len(due)} задач:*"]
-    for t in due:
-        lines.append(fmt_deadline_line(t))
-    msg = "\n".join(lines)
-    for chat_id in DIGEST_CHAT_IDS:
-        try:
-            await context.bot.send_message(chat_id=chat_id, text=msg,
-                                           parse_mode="Markdown", disable_web_page_preview=True)
-        except Exception as e:
-            logger.error(f"Deadline check send error {chat_id}: {e}")
+    today = date.today()
+
+    # Просроченные задачи (дедлайн уже прошёл)
+    try:
+        overdue_res = notion.databases.query(
+            database_id=TASKS_DB,
+            filter={"and": [
+                {"property": "Дедлайн", "date": {"before": today.isoformat()}},
+                {"property": "Статус", "select": {"does_not_equal": "✅ Сдано"}},
+                {"property": "Статус", "select": {"does_not_equal": "❌ Отменено"}},
+                {"property": "Статус", "select": {"does_not_equal": "⏸️ Заморожено"}},
+            ]},
+            page_size=20,
+        )
+        overdue = overdue_res.get("results", [])
+    except Exception as e:
+        logger.error(f"overdue query: {e}")
+        overdue = []
+
+    # Задачи с дедлайном в ближайшие 24 часа
+    due_soon = get_due_soon(days=1)
+
+    # Пингуем прямо в топике задачи
+    async def ping_in_topic(task: dict, prefix: str) -> None:
+        p = task["properties"]
+        name     = _get_title(p)[:60] or "Задача"
+        assignee = _get_rich(p, "Исполнитель")
+        tg_url   = p.get("Ссылка TG", {}).get("url", "")
+        dl       = (p.get("Дедлайн") or {}).get("date", {})
+        dl_str   = dl.get("start", "—") if isinstance(dl, dict) else "—"
+        chat_id_raw = (p.get("TG Chat ID") or {}).get("number")
+        thread_id_raw = (p.get("TG Thread ID") or {}).get("number")
+
+        mention = assignee if assignee and assignee != "—" else ""
+        text = (
+            f"{prefix}\n"
+            f"*{name}*\n"
+            f"📅 Дедлайн: {dl_str}\n"
+            + (f"👤 {mention}\n" if mention else "")
+            + (f"[→ Сообщение]({tg_url})" if tg_url else "")
+        )
+
+        sent = False
+        # Пробуем отправить в конкретный топик
+        if chat_id_raw and thread_id_raw:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(chat_id_raw),
+                    message_thread_id=int(thread_id_raw),
+                    text=text,
+                    parse_mode="Markdown",
+                    disable_web_page_preview=True,
+                )
+                sent = True
+            except Exception as e:
+                logger.warning(f"ping_in_topic direct failed: {e}")
+
+        # Fallback — шлём в общий дайджест-чат
+        if not sent:
+            for cid in DIGEST_CHAT_IDS:
+                try:
+                    await context.bot.send_message(
+                        chat_id=cid, text=text,
+                        parse_mode="Markdown", disable_web_page_preview=True,
+                    )
+                except Exception as e:
+                    logger.error(f"ping fallback {cid}: {e}")
+
+    for task in overdue:
+        await ping_in_topic(task, "🚨 *ПРОСРОЧЕНО!*")
+
+    for task in due_soon:
+        # Не дублируем если уже в просроченных
+        tid = task["id"]
+        if any(t["id"] == tid for t in overdue):
+            continue
+        await ping_in_topic(task, "⏰ *Дедлайн через 24 часа*")
 
 
 async def job_waiting_check(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1019,6 +1162,25 @@ async def job_waiting_check(context: ContextTypes.DEFAULT_TYPE) -> None:
             logger.error(f"Waiting check send error {chat_id}: {e}")
 
 
+async def handle_new_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Автоматически создаёт проект в Notion при создании нового топика в группе."""
+    message = update.message
+    if not message or not message.forum_topic_created:
+        return
+    topic_name = message.forum_topic_created.name
+    thread_id  = message.message_thread_id
+    chat_id    = message.chat_id
+    created    = create_project(topic_name, thread_id, chat_id)
+    if created:
+        await message.reply_text(
+            f"📁 Проект *{topic_name}* добавлен в Notion\n"
+            f"Топик ID: `{thread_id}`",
+            parse_mode="Markdown",
+            message_thread_id=thread_id,
+        )
+        logger.info(f"Auto-created project: {topic_name} (thread_id={thread_id})")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1028,6 +1190,7 @@ def main() -> None:
     # Сообщения
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_message))
+    app.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CREATED, handle_new_topic))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
     # Статусы
@@ -1051,8 +1214,8 @@ def main() -> None:
     # Расписание
     jq: JobQueue = app.job_queue
     jq.run_daily(job_morning_digest, time=time(hour=DIGEST_HOUR, minute=0))
-    jq.run_daily(job_deadline_check, time=time(hour=20, minute=0))
-    jq.run_repeating(job_waiting_check, interval=21600, first=600)  # каждые 6 часов
+    jq.run_repeating(job_deadline_check, interval=21600, first=300)  # каждые 6 часов
+    jq.run_repeating(job_waiting_check,  interval=21600, first=600)  # каждые 6 часов
 
     logger.info("🚀 PostProd Bot v2.0 started!")
     app.run_polling(drop_pending_updates=True)
