@@ -113,6 +113,13 @@ def is_file_link(url: str) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 # Парсинг текста
 # ─────────────────────────────────────────────────────────────────────────────
+def escape_md(text: str) -> str:
+    """Экранирует спецсимволы Markdown v1 в динамическом тексте."""
+    for ch in ("_", "*", "`", "["):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
 def parse_hashtags(text: str) -> list[str]:
     # Поддержка точек в номерах выпусков: #ep2.1, #2.2, #серия_1.3
     return re.findall(r"#([\w][\w.]*)", text)
@@ -646,7 +653,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not text:
             await message.reply_text("❌ Не удалось распознать голосовое", message_thread_id=thread_id)
             return
-        await message.reply_text(f"📝 _{text}_", parse_mode="Markdown", message_thread_id=thread_id)
+        await message.reply_text(f"📝 _{escape_md(text)}_", parse_mode="Markdown", message_thread_id=thread_id)
 
     if not text:
         return
@@ -756,12 +763,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await message.reply_text(
         f"🤖 *Создать задачу?*\n\n"
-        f"📝 {task_name}\n"
-        f"📁 *Проект:* {topic}\n"
-        f"🔖 *Выпуск:* {ep_str}\n"
-        f"👤 *Исполнитель:* {assign_str}\n"
-        f"📊 *Статус:* {status}\n"
-        f"📅 *Дедлайн:* {dl_str}",
+        f"📝 {escape_md(task_name)}\n"
+        f"📁 *Проект:* {escape_md(topic)}\n"
+        f"🔖 *Выпуск:* {escape_md(ep_str)}\n"
+        f"👤 *Исполнитель:* {escape_md(assign_str)}\n"
+        f"📊 *Статус:* {escape_md(status)}\n"
+        f"📅 *Дедлайн:* {escape_md(dl_str)}",
         parse_mode="Markdown",
         reply_markup=keyboard,
         message_thread_id=thread_id,
@@ -799,7 +806,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         if page_id:
             ep = f" · #{td['episode']}" if td["episode"] else ""
             await query.edit_message_text(
-                f"✅ *Задача создана{ep}*\n_{td['task_name']}_",
+                f"✅ *Задача создана{escape_md(ep)}*\n_{escape_md(td['task_name'])}_",
                 parse_mode="Markdown",
             )
             # Логируем в дневник
@@ -1097,9 +1104,9 @@ async def job_deadline_check(context: ContextTypes.DEFAULT_TYPE) -> None:
         mention = assignee if assignee and assignee != "—" else ""
         text = (
             f"{prefix}\n"
-            f"*{name}*\n"
-            f"📅 Дедлайн: {dl_str}\n"
-            + (f"👤 {mention}\n" if mention else "")
+            f"*{escape_md(name)}*\n"
+            f"📅 Дедлайн: {escape_md(dl_str)}\n"
+            + (f"👤 {escape_md(mention)}\n" if mention else "")
             + (f"[→ Сообщение]({tg_url})" if tg_url else "")
         )
 
