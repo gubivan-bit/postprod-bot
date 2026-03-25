@@ -60,6 +60,7 @@ TASKS_DB    = os.environ.get("NOTION_TASKS_DB",    "f9f3a6736e81473e8a64ff600083
 PROJECTS_DB = os.environ.get("NOTION_PROJECTS_DB", "7e7b1e5c0323430cac6bc22c8f26c875")
 PATTERNS_DB = os.environ.get("NOTION_PATTERNS_DB", "01f7f279ef1442bb83f95c114bde90b0")
 DIARY_DB    = os.environ.get("NOTION_DIARY_DB",    "f0aa66009b8e4ef2b9f98d4123c94155")
+REPORTS_DB  = os.environ.get("NOTION_REPORTS_DB",  "b2d4a56277bb44efb605895f5f7a4387")
 
 # Чаты куда слать дайджест/алерты (через запятую, например: -100123456,-100654321)
 DIGEST_CHAT_IDS: list[int] = [
@@ -541,6 +542,99 @@ def create_project(topic_name: str, thread_id: int, chat_id: int) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Ежедневный отчёт
+# ─────────────────────────────────────────────────────────────────────────────
+async def generate_daily_report(target_date: date) -> None:
+    """Генерирует GPT-сводку за указанный день и сохраняет в Notion."""
+    try:
+        # Берём события за указанный день из Дневника
+        res = notion.databases.query(
+            database_id=DIARY_DB,
+            filter={"property": "Дата", "date": {"equals": target_date.isoformat()}},
+            page_size=100,
+        )
+        events = res.get("results", [])
+        if not events:
+            logger.info(f"daily_report: no events for {target_date}")
+            return
+
+        # Группируем по проекту
+        by_project: dict[str, list[str]] = {}
+        for e in events:
+            p = e["properties"]
+            project = p.get("Проект", {}).get("rich_text", [{}])
+            project = project[0].get("text", {}).get("content", "—") if project else "—"
+            event_type = (p.get("Тип", {}).get("select") or {}).get("name", "")
+            event_name = (p.get("Событие", {}).get("title") or [{}])
+            event_name = event_name[0].get("text", {}).get("content", "") if event_name else ""
+            episode = (p.get("Выпуск", {}).get("rich_text") or [{}])
+            episode = episode[0].get("text", {}).get("content", "") if episode else ""
+            line = f"- [{event_type}] {event_name}" + (f" (#{episode})" if episode else "")
+            by_project.setdefault(project, []).append(line)
+
+        # Формируем промпт для GPT
+        events_text = ""
+        for proj, lines in by_project.items():
+            events_text += f"\nПроект: {proj}\n" + "\n".join(lines) + "\n"
+
+        prompt = (
+            f"Ты ассистент пост-продакшн студии. Составь дневной отчёт за {target_date.strftime('%d.%m.%Y')}.\n\n"
+            f"Ниже — всё что происходило в каждой рабочей ветке за день. "
+            f"Включает переписку, обсуждения, правки, смены статусов и создание задач.\n\n"
+            f"{events_text}\n\n"
+            f"Для каждого проекта напиши 3-5 предложений: что обсуждалось, какая работа велась, "
+            f"какие решения приняты, на каком этапе сейчас. "
+            f"Пиши как будто объясняешь руководителю что происходило в команде за день. "
+            f"Стиль — деловой, конкретный, без воды. "
+            f"Формат: ### Название проекта, затем текст."
+        )
+
+        resp = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=800,
+        )
+        summary = resp.choices[0].message.content.strip()
+
+        # Статистика
+        n_tasks   = sum(1 for e in events if "Задача создана" in str(e["properties"].get("Тип", "")))
+        n_status  = sum(1 for e in events if "Статус" in str(e["properties"].get("Тип", "")))
+        n_projects = len(by_project)
+
+        # Создаём страницу в Ежедневные отчёты
+        page = notion.pages.create(
+            parent={"database_id": REPORTS_DB},
+            properties={
+                "Дата":               {"title": _rich_text(target_date.strftime("%d.%m.%Y"))},
+                "Проектов активных":  {"number": n_projects},
+                "Задач создано":      {"number": n_tasks},
+                "Статусов изменено":  {"number": n_status},
+                "Итого событий":      {"number": len(events)},
+            },
+            children=[
+                {
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {
+                        "rich_text": [{"type": "text", "text": {"content": summary[:2000]}}]
+                    },
+                }
+            ],
+        )
+        logger.info(f"daily_report created for {target_date}: {page['id']}")
+
+    except Exception as e:
+        logger.error(f"generate_daily_report: {e}")
+
+
+async def job_daily_report(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Scheduled job: генерирует отчёт за вчера каждое утро в 8:50."""
+    yesterday = date.today() - timedelta(days=1)
+    await generate_daily_report(yesterday)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GPT helpers
 # ─────────────────────────────────────────────────────────────────────────────
 _GPT_SYSTEM = """Ты ассистент по управлению задачами в компании видеомонтажа (пост-продакшен).
@@ -703,6 +797,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             active = find_active_task(topic, episode)
             if active:
                 append_links(active["id"], file_links)
+        # Логируем активность в дневник даже если не задача (если GPT дал summary)
+        gpt_summary = analysis.get("summary", "")
+        if gpt_summary and analysis.get("confidence", 0) > 0.2:
+            log_event(
+                event=gpt_summary[:200],
+                project=topic,
+                event_type="💬 Активность",
+                episode=episode,
+                assignee=", ".join(f"@{a}" for a in (analysis.get("assignees") or mentions)),
+                tg_link=build_tg_link(message.chat_id, message.message_id),
+            )
         return
 
     task_name   = analysis.get("task_name") or text[:100]
@@ -849,6 +954,14 @@ async def _set_status(
         suffix = " (+1 итерация)" if increment_iter else ""
         await msg.reply_text(f"{emoji} Статус → *{status}*{suffix}",
                              parse_mode="Markdown", message_thread_id=tid)
+        # Логируем смену статуса в Дневник
+        project = get_project_name(tid) if tid else "—"
+        log_event(
+            event=f"Статус изменён → {status}",
+            project=project or "—",
+            event_type="📝 Статус изменён" if status != "🔄 Правки" else "🔄 Правки",
+            tg_link=tg_link,
+        )
     else:
         await msg.reply_text("❓ Задача не найдена в базе", message_thread_id=tid)
 
@@ -1224,6 +1337,7 @@ def main() -> None:
     # Расписание
     jq: JobQueue = app.job_queue
     jq.run_daily(job_morning_digest, time=time(hour=DIGEST_HOUR, minute=0))
+    jq.run_daily(job_daily_report,   time=time(hour=DIGEST_HOUR - 1, minute=50))  # в 8:50 — до дайджеста
     jq.run_repeating(job_deadline_check, interval=21600, first=300)  # каждые 6 часов
     jq.run_repeating(job_waiting_check,  interval=21600, first=600)  # каждые 6 часов
 
