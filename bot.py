@@ -15,9 +15,9 @@ Telegram + GPT-4o + Notion
   • Дневник активности + ежедневный GPT-отчёт
 
 Новый UX (v2.1) — без reply на первое сообщение:
-  /задача авито 25          → карточка с кнопками статуса
+  /task авито 25            → карточка с кнопками статуса
   /авито 25                 → то же самое (умная команда)
-  /статус авито 25 монтаж   → смена статуса по проекту+выпуску
+  /s авито 25 монтаж        → смена статуса по проекту+выпуску
 
 Статусы через reply на сообщение задачи:
   /inprogress   ✂️ Монтаж
@@ -1286,17 +1286,17 @@ STATUS_ALIASES: dict[str, tuple[str, bool]] = {
 
 async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /задача <проект> <выпуск>
+    /task <проект> <выпуск>
     Показывает карточку активной задачи с кнопками статуса.
-    Пример: /задача авито 25
+    Пример: /task авито 25
     """
     msg = update.message
     tid = msg.message_thread_id
 
     if not context.args:
         await msg.reply_text(
-            "📋 Использование: `/задача <проект> <выпуск>`\n"
-            "_Пример: /задача авито 25_",
+            "📋 Использование: `/task <проект> <выпуск>`\n"
+            "_Пример: /task авито 25_",
             parse_mode="Markdown",
             message_thread_id=tid,
         )
@@ -1331,22 +1331,22 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_status_ref(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /статус <проект> <выпуск> <статус>
+    /s <проект> <выпуск> <статус>
     Меняет статус задачи без reply, прямо по имени проекта и выпуска.
-    Пример: /статус авито 25 монтаж
-    Пример: /статус авито 25 сдано
+    Пример: /s авито 25 монтаж
+    Пример: /s авито 25 сдано
     """
     msg = update.message
     tid = msg.message_thread_id
 
     if len(context.args) < 3:
         await msg.reply_text(
-            "📊 Использование: `/статус <проект> <выпуск> <статус>`\n\n"
+            "📊 Использование: `/s <проект> <выпуск> <статус>`\n\n"
             "*Доступные статусы:*\n"
             "`монтаж` · `правки` · `финал` · `клиент`\n"
             "`согласование` · `сдано` · `стоп`\n"
             "`цвет` · `звук` · `графика`\n\n"
-            "_Пример: /статус авито 25 монтаж_",
+            "_Пример: /s авито 25 монтаж_",
             parse_mode="Markdown",
             message_thread_id=tid,
         )
@@ -1394,7 +1394,7 @@ async def cmd_status_ref(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         message_thread_id=tid,
     )
     log_event(
-        event=f"Статус изменён → {status} (команда /статус)",
+        event=f"Статус изменён → {status} (команда /s)",
         project=project_name,
         event_type="📝 Статус изменён" if status != "🔄 Правки" else "🔄 Правки",
         episode=episode_query,
@@ -1423,7 +1423,7 @@ async def cmd_smart_project(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     RESERVED = {
         "done", "inprogress", "review", "final", "freeze",
         "deadline", "assign", "waiting", "report", "help",
-        "start", "topicid", "задача", "статус",
+        "start", "topicid", "task", "s",
     }
     if cmd_part in RESERVED:
         return
@@ -1464,11 +1464,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "*Создание задачи:*\n"
         "Напиши сообщение с `#выпуск` и `@исполнитель` в ветке проекта\n\n"
         "*Найти задачу по проекту + выпуску:*\n"
-        "`/задача авито 25` — карточка с кнопками статусов\n"
+        "`/task авито 25` — карточка с кнопками статусов\n"
         "`/авито 25` — то же самое, сокращённо\n\n"
         "*Сменить статус без reply:*\n"
-        "`/статус авито 25 монтаж`\n"
-        "`/статус авито 25 сдано`\n"
+        "`/s авито 25 монтаж`\n"
+        "`/s авито 25 сдано`\n"
         "Статусы: `монтаж` · `правки` · `финал` · `клиент`\n"
         "         `согласование` · `сдано` · `стоп`\n"
         "         `цвет` · `звук` · `графика`\n\n"
@@ -1686,8 +1686,8 @@ def main() -> None:
     app.add_handler(CommandHandler("waiting",  cmd_waiting))
 
     # Новые UX-команды (по проекту + выпуску)
-    app.add_handler(CommandHandler("задача",  cmd_task))
-    app.add_handler(CommandHandler("статус",  cmd_status_ref))
+    app.add_handler(CommandHandler("task", cmd_task))
+    app.add_handler(CommandHandler("s",    cmd_status_ref))
 
     # Инфо
     app.add_handler(CommandHandler("report",  cmd_report))
