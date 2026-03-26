@@ -633,7 +633,7 @@ async def generate_daily_report(target_date: date) -> None:
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
-            max_tokens=800,
+            max_tokens=1200,
         )
         summary = resp.choices[0].message.content.strip()
 
@@ -643,6 +643,15 @@ async def generate_daily_report(target_date: date) -> None:
         n_projects = len(by_project)
 
         # Создаём страницу в Ежедневные отчёты
+        # Режем summary на куски по 2000 символов (лимит Notion на rich_text блок)
+        def _summary_blocks(text: str) -> list:
+            chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
+            return [
+                {"object": "block", "type": "paragraph",
+                 "paragraph": {"rich_text": [{"type": "text", "text": {"content": c}}]}}
+                for c in chunks
+            ]
+
         page = notion.pages.create(
             parent={"database_id": REPORTS_DB},
             properties={
@@ -652,26 +661,39 @@ async def generate_daily_report(target_date: date) -> None:
                 "Статусов изменено":  {"number": n_status},
                 "Итого событий":      {"number": len(events)},
             },
-            children=[
-                {
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {
-                        "rich_text": [{"type": "text", "text": {"content": summary[:2000]}}]
-                    },
-                }
-            ],
+            children=_summary_blocks(summary) if summary else [],
         )
         logger.info(f"daily_report created for {target_date}: {page['id']}")
+        return summary  # возвращаем текст для отправки в Telegram
 
     except Exception as e:
         logger.error(f"generate_daily_report: {e}")
+        return None
 
 
 async def job_daily_report(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Scheduled job: генерирует отчёт за вчера каждое утро в 8:50."""
+    """Scheduled job: генерирует отчёт за вчера и отправляет в Telegram в 8:50."""
     yesterday = date.today() - timedelta(days=1)
-    await generate_daily_report(yesterday)
+    summary = await generate_daily_report(yesterday)
+
+    if not summary or not DIGEST_CHAT_IDS:
+        return
+
+    header = f"📋 *Отчёт за {yesterday.strftime('%d.%m.%Y')}*\n\n"
+    full_text = header + summary
+
+    # Telegram ограничивает сообщение 4096 символами — режем если нужно
+    chunks = [full_text[i:i+4000] for i in range(0, len(full_text), 4000)]
+    for chat_id in DIGEST_CHAT_IDS:
+        for chunk in chunks:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=chunk,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                logger.error(f"daily_report send error {chat_id}: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
