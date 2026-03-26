@@ -1445,7 +1445,7 @@ async def cmd_smart_project(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     RESERVED = {
         "done", "inprogress", "review", "final", "freeze",
         "deadline", "assign", "waiting", "report", "help",
-        "start", "topicid", "task", "s",
+        "start", "topicid", "task", "s", "test",
     }
     if cmd_part in RESERVED:
         return
@@ -1505,6 +1505,72 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "`/assign @kate` — назначить исполнителя\n"
         "`/waiting цвет` — ждём внешний отдел\n\n"
         "`/report` — 📊 дайджест задач",
+        parse_mode="Markdown",
+        message_thread_id=tid,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Диагностика
+# ─────────────────────────────────────────────────────────────────────────────
+async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /test — проверяет соединение с OpenAI и Notion.
+    Выводит статус каждого сервиса прямо в чат.
+    """
+    msg = update.message
+    tid = msg.message_thread_id
+    await msg.reply_text("🔍 Проверяю соединения...", message_thread_id=tid)
+
+    lines = []
+
+    # ── OpenAI ──────────────────────────────────────────────────────────────
+    try:
+        resp = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "Ответь одним словом: работаю"}],
+            max_tokens=10,
+            temperature=0,
+        )
+        answer = resp.choices[0].message.content.strip()
+        lines.append(f"✅ *OpenAI* — ок (`{escape_md(answer)}`)")
+    except Exception as e:
+        lines.append(f"❌ *OpenAI* — ошибка:\n`{escape_md(str(e)[:200])}`")
+
+    # ── Notion — Задачи ──────────────────────────────────────────────────────
+    try:
+        res = notion.databases.retrieve(database_id=TASKS_DB)
+        db_name = res.get("title", [{}])[0].get("plain_text", TASKS_DB[:8])
+        lines.append(f"✅ *Notion / Задачи* — ок (`{escape_md(db_name)}`)")
+    except Exception as e:
+        lines.append(f"❌ *Notion / Задачи* — ошибка:\n`{escape_md(str(e)[:200])}`")
+
+    # ── Notion — Проекты ────────────────────────────────────────────────────
+    try:
+        res = notion.databases.retrieve(database_id=PROJECTS_DB)
+        db_name = res.get("title", [{}])[0].get("plain_text", PROJECTS_DB[:8])
+        lines.append(f"✅ *Notion / Проекты* — ок (`{escape_md(db_name)}`)")
+    except Exception as e:
+        lines.append(f"❌ *Notion / Проекты* — ошибка:\n`{escape_md(str(e)[:200])}`")
+
+    # ── Notion — Дневник ────────────────────────────────────────────────────
+    try:
+        res = notion.databases.retrieve(database_id=DIARY_DB)
+        db_name = res.get("title", [{}])[0].get("plain_text", DIARY_DB[:8])
+        lines.append(f"✅ *Notion / Дневник* — ок (`{escape_md(db_name)}`)")
+    except Exception as e:
+        lines.append(f"❌ *Notion / Дневник* — ошибка:\n`{escape_md(str(e)[:200])}`")
+
+    # ── Notion — Отчёты ─────────────────────────────────────────────────────
+    try:
+        res = notion.databases.retrieve(database_id=REPORTS_DB)
+        db_name = res.get("title", [{}])[0].get("plain_text", REPORTS_DB[:8])
+        lines.append(f"✅ *Notion / Отчёты* — ок (`{escape_md(db_name)}`)")
+    except Exception as e:
+        lines.append(f"❌ *Notion / Отчёты* — ошибка:\n`{escape_md(str(e)[:200])}`")
+
+    await msg.reply_text(
+        "🛠 *Диагностика*\n\n" + "\n".join(lines),
         parse_mode="Markdown",
         message_thread_id=tid,
     )
@@ -1716,6 +1782,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help",    cmd_help))
     app.add_handler(CommandHandler("start",   cmd_help))
     app.add_handler(CommandHandler("topicid", cmd_topicid))
+    app.add_handler(CommandHandler("test",    cmd_test))
 
     # Умные команды /авито 25 — перехватывает всё остальное
     # (должно быть ПОСЛЕДНИМ, чтобы не перекрывать специфические команды)
