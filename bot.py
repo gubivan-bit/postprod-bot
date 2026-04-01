@@ -51,6 +51,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     JobQueue,
@@ -360,6 +361,12 @@ def update_status(page_id: str, status: str, increment_iter: bool = False) -> bo
             page = notion.pages.retrieve(page_id=page_id)
             cur = page["properties"].get("Итерация правок", {}).get("number") or 0
             props["Итерация правок"] = {"number": cur + 1}
+        # При переводе в Сдано — ставим флаг Архив (если поле существует в базе)
+        if status == "✅ Сдано":
+            try:
+                props["Архив"] = {"checkbox": True}
+            except Exception:
+                pass  # поле может отсутствовать — не критично
         notion.pages.update(page_id=page_id, properties=props)
         return True
     except Exception as e:
@@ -825,15 +832,17 @@ async def _show_task_card(
         [
             InlineKeyboardButton("✂️ Монтаж",    callback_data=_cb("inprogress")),
             InlineKeyboardButton("🔄 Правки",    callback_data=_cb("review")),
-            InlineKeyboardButton("👁️ Финал",     callback_data=_cb("final")),
+            InlineKeyboardButton("🟡 Согласов.", callback_data=_cb("approval")),
         ],
         [
-            InlineKeyboardButton("📤 Клиенту",   callback_data=_cb("sent")),
-            InlineKeyboardButton("🟡 Согласов.", callback_data=_cb("approval")),
+            InlineKeyboardButton("🎨 Цвет",      callback_data=_cb("color")),
+            InlineKeyboardButton("🔊 Звук",      callback_data=_cb("sound")),
             InlineKeyboardButton("✅ Сдано",     callback_data=_cb("done")),
         ],
         [
-            InlineKeyboardButton("⏸️ Заморожено", callback_data=_cb("freeze")),
+            InlineKeyboardButton("👁️ Финал",     callback_data=_cb("final")),
+            InlineKeyboardButton("📤 Клиенту",   callback_data=_cb("sent")),
+            InlineKeyboardButton("⏸️ Стоп",      callback_data=_cb("freeze")),
         ],
     ])
 
@@ -861,10 +870,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if message.is_topic_message and thread_id:
         fc = getattr(message, "forum_topic_created", None)
         if fc:
+            # Это сообщение-создание топика — регистрируем сразу
             topic = fc.name
         else:
             notion_name = get_project_name(thread_id)
-            topic = notion_name if notion_name else f"Топик-{thread_id}"
+            if notion_name:
+                topic = notion_name
+            else:
+                # Топик не зарегистрирован — пробуем авторегистрацию
+                # В Telegram reply_to_message первого сообщения в топике
+                # содержит forum_topic_created с именем топика
+                auto_name: Optional[str] = None
+                rpl = getattr(message, "reply_to_message", None)
+                if rpl:
+                    fc2 = getattr(rpl, "forum_topic_created", None)
+                    if fc2:
+                        auto_name = fc2.name
+
+                if auto_name:
+                    created = create_project(auto_name, thread_id, message.chat_id)
+                    if created:
+                        logger.info(f"Auto-registered topic '{auto_name}' id={thread_id}")
+                        await message.reply_text(
+                            f"📁 Топик *{escape_md(auto_name)}* авторегистрирован в Notion!",
+                            parse_mode="Markdown",
+                            message_thread_id=thread_id,
+                        )
+                    topic = auto_name
+                else:
+                    # Имя не удалось определить — подсказываем один раз
+                    reg_key = f"reg_hint_{thread_id}"
+                    if not context.bot_data.get(reg_key):
+                        context.bot_data[reg_key] = True
+                        await message.reply_text(
+                            "⚠️ Этот топик не зарегистрирован в базе.\n"
+                            "Введи: `/setup Название проекта`\n"
+                            "_(например: /setup СОЛНЫШКО)_",
+                            parse_mode="Markdown",
+                            message_thread_id=thread_id,
+                        )
+                    topic = f"Топик-{thread_id}"  # временное имя
 
     # Сообщения из General (не топик) — игнорируем, только команды
     if not topic:
@@ -1073,6 +1118,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "approval":   ("🟡 На согласовании",    False),
             "done":       ("✅ Сдано",              False),
             "freeze":     ("⏸️ Заморожено",          False),
+            "color":      ("🎨 Ждём цвет",          False),
+            "sound":      ("🔊 Ждём звук",          False),
         }
         parts = data.split(":", 2)
         if len(parts) < 3:
@@ -1139,6 +1186,12 @@ async def cmd_inprogress(u, c): await _set_status(u, c, "✂️ Монтаж",  
 async def cmd_review(u, c):     await _set_status(u, c, "🔄 Правки",              "🔄", increment_iter=True)
 async def cmd_final(u, c):      await _set_status(u, c, "👁️ Финальный просмотр", "👁️")
 async def cmd_freeze(u, c):     await _set_status(u, c, "⏸️ Заморожено",          "⏸️")
+
+# Короткие алиасы (те же обработчики)
+cmd_d  = cmd_done        # /d  → /done
+cmd_ip = cmd_inprogress  # /ip → /inprogress
+cmd_r  = cmd_review      # /r  → /review
+cmd_f  = cmd_final       # /f  → /final
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1324,8 +1377,15 @@ async def cmd_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    project_query = context.args[0]
-    episode_query = context.args[1] if len(context.args) > 1 else ""
+    # Поддержка многословных проектов: /task не мои мысли 2
+    # Последний аргумент = выпуск, всё предыдущее = название проекта
+    # Подчёркивание работает как пробел: /task не_мои_мысли 2
+    if len(context.args) >= 2:
+        project_query = " ".join(context.args[:-1]).replace("_", " ")
+        episode_query = context.args[-1]
+    else:
+        project_query = context.args[0].replace("_", " ")
+        episode_query = ""
 
     project_name = find_project_fuzzy(project_query)
     if not project_name:
@@ -1368,15 +1428,19 @@ async def cmd_status_ref(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "`монтаж` · `правки` · `финал` · `клиент`\n"
             "`согласование` · `сдано` · `стоп`\n"
             "`цвет` · `звук` · `графика`\n\n"
-            "_Пример: /s авито 25 монтаж_",
+            "_Пример: /s авито 25 монтаж_\n"
+            "_Пример: /s не_мои_мысли 2 правки_",
             parse_mode="Markdown",
             message_thread_id=tid,
         )
         return
 
-    project_query = context.args[0]
-    episode_query = context.args[1]
-    status_key    = context.args[2].lower()
+    # Поддержка многословных проектов: /s не мои мысли 2 монтаж
+    # Последний аргумент = статус, предпоследний = выпуск, остальные = проект
+    # Подчёркивание работает как пробел: /s не_мои_мысли 2 монтаж
+    status_key    = context.args[-1].lower()
+    episode_query = context.args[-2]
+    project_query = " ".join(context.args[:-2]).replace("_", " ") if len(context.args) > 3 else context.args[0].replace("_", " ")
 
     if status_key not in STATUS_ALIASES:
         await msg.reply_text(
@@ -1445,7 +1509,8 @@ async def cmd_smart_project(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     RESERVED = {
         "done", "inprogress", "review", "final", "freeze",
         "deadline", "assign", "waiting", "report", "help",
-        "start", "topicid", "task", "s", "test",
+        "start", "topicid", "task", "s", "test", "setup",
+        "d", "ip", "r", "f", "t",  # короткие алиасы
     }
     if cmd_part in RESERVED:
         return
@@ -1477,6 +1542,65 @@ async def cmd_smart_project(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     await _show_task_card(msg, task, context.bot_data, thread_id=tid)
+
+
+async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /setup <Название проекта>
+    Регистрирует текущий топик как проект в Notion.
+    Использование: /setup СОЛНЫШКО
+    """
+    msg = update.message
+    tid = msg.message_thread_id
+    chat_id = msg.chat_id
+
+    if not tid:
+        await msg.reply_text(
+            "⚠️ Эта команда работает только внутри топика (ветки).\n"
+            "Перейди в нужный топик и повтори.",
+            message_thread_id=None,
+        )
+        return
+
+    if not context.args:
+        await msg.reply_text(
+            "📁 Использование: `/setup Название проекта`\n\n"
+            "_Пример: /setup СОЛНЫШКО_\n"
+            "_Пример: /setup Не мои мысли_\n\n"
+            f"Текущий топик ID: `{tid}`",
+            parse_mode="Markdown",
+            message_thread_id=tid,
+        )
+        return
+
+    project_name = " ".join(context.args).strip()
+    created = create_project(project_name, tid, chat_id)
+    if created:
+        await msg.reply_text(
+            f"✅ Проект *{escape_md(project_name)}* зарегистрирован!\n"
+            f"Топик ID: `{tid}`\n\n"
+            f"Теперь можно:\n"
+            f"• `/task {project_name.lower()} 1` — открыть задачу\n"
+            f"• `/s {project_name.lower()} 1 монтаж` — сменить статус",
+            parse_mode="Markdown",
+            message_thread_id=tid,
+        )
+        logger.info(f"cmd_setup: registered '{project_name}' thread_id={tid} chat_id={chat_id}")
+    else:
+        # Проверяем — может уже зарегистрирован
+        existing = get_project_name(tid)
+        if existing:
+            await msg.reply_text(
+                f"ℹ️ Топик уже зарегистрирован как *{escape_md(existing)}*.\n"
+                f"Если надо изменить название — сделай это вручную в Notion.",
+                parse_mode="Markdown",
+                message_thread_id=tid,
+            )
+        else:
+            await msg.reply_text(
+                "❌ Ошибка при создании проекта. Проверь подключение к Notion.",
+                message_thread_id=tid,
+            )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1750,10 +1874,68 @@ async def handle_new_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Добавление бота в новый чат
+# ─────────────────────────────────────────────────────────────────────────────
+async def handle_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Срабатывает когда бот добавлен в группу (MY_CHAT_MEMBER).
+    Telegram Bot API не позволяет получить список существующих топиков —
+    поэтому отправляем инструкцию и регистрируем топики лениво,
+    при первом сообщении в каждом из них.
+    """
+    result = update.my_chat_member
+    if not result:
+        return
+
+    old_status = result.old_chat_member.status
+    new_status = result.new_chat_member.status
+
+    # Бот только что добавлен (был kicked/left → стал member/administrator)
+    if old_status not in ("left", "kicked") or new_status not in ("member", "administrator"):
+        return
+
+    chat_id    = result.chat.id
+    chat_title = result.chat.title or "чат"
+    is_forum   = getattr(result.chat, "is_forum", False)
+
+    if is_forum:
+        text = (
+            f"👋 Привет, *{escape_md(chat_title)}*!\n\n"
+            f"Я бот управления задачами пост-продакшена.\n\n"
+            f"*Как зарегистрировать топики:*\n"
+            f"Зайди в каждый топик и напиши в нём — я авторегистрирую его.\n"
+            f"Или вручную: `/setup Название` прямо в топике.\n\n"
+            f"После регистрации доступны команды:\n"
+            f"`/t <проект> <выпуск>` — карточка задачи\n"
+            f"`/s <проект> <выпуск> <статус>` — сменить статус\n\n"
+            f"📖 /help — полная справка"
+        )
+    else:
+        text = (
+            f"👋 Привет, *{escape_md(chat_title)}*!\n\n"
+            f"Я PostProd бот для управления задачами монтажа.\n"
+            f"📖 /help — справка по командам"
+        )
+
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode="Markdown",
+        )
+        logger.info(f"Bot added to chat {chat_id} ({chat_title}), sent welcome")
+    except Exception as e:
+        logger.error(f"handle_bot_added send: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Добавление бота в чат — приветствие + инструкция по регистрации топиков
+    app.add_handler(ChatMemberHandler(handle_bot_added, ChatMemberHandler.MY_CHAT_MEMBER))
 
     # Сообщения
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -1761,21 +1943,29 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CREATED, handle_new_topic))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Статусы
+    # Статусы (полные команды)
     app.add_handler(CommandHandler("done",       cmd_done))
     app.add_handler(CommandHandler("inprogress", cmd_inprogress))
     app.add_handler(CommandHandler("review",     cmd_review))
     app.add_handler(CommandHandler("final",      cmd_final))
     app.add_handler(CommandHandler("freeze",     cmd_freeze))
 
+    # Короткие алиасы статусов
+    app.add_handler(CommandHandler("d",  cmd_d))   # /d  → сдано
+    app.add_handler(CommandHandler("ip", cmd_ip))  # /ip → монтаж
+    app.add_handler(CommandHandler("r",  cmd_r))   # /r  → правки
+    app.add_handler(CommandHandler("f",  cmd_f))   # /f  → финал
+
     # Управление
     app.add_handler(CommandHandler("deadline", cmd_deadline))
     app.add_handler(CommandHandler("assign",   cmd_assign))
     app.add_handler(CommandHandler("waiting",  cmd_waiting))
 
-    # Новые UX-команды (по проекту + выпуску)
-    app.add_handler(CommandHandler("task", cmd_task))
-    app.add_handler(CommandHandler("s",    cmd_status_ref))
+    # UX-команды (по проекту + выпуску)
+    app.add_handler(CommandHandler("task",  cmd_task))
+    app.add_handler(CommandHandler("t",     cmd_task))   # /t = короткий алиас /task
+    app.add_handler(CommandHandler("s",     cmd_status_ref))
+    app.add_handler(CommandHandler("setup", cmd_setup))
 
     # Инфо
     app.add_handler(CommandHandler("report",  cmd_report))
