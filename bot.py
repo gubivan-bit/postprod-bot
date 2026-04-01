@@ -440,6 +440,46 @@ def append_links(page_id: str, new_links: list[str]) -> bool:
         return False
 
 
+def get_all_chat_ids_from_tasks() -> set[int]:
+    """
+    Собирает все уникальные TG Chat ID из базы Задач.
+    Используется как persistent fallback — данные выживают после редеплоя.
+    """
+    try:
+        res = notion.databases.query(
+            database_id=TASKS_DB,
+            filter={
+                "and": [
+                    {"property": "Статус", "select": {"does_not_equal": "❌ Отменено"}},
+                    {"property": "Статус", "select": {"does_not_equal": "✅ Сдано"}},
+                ]
+            },
+            page_size=100,
+        )
+        ids: set[int] = set()
+        for page in res.get("results", []):
+            cid = (page["properties"].get("TG Chat ID") or {}).get("number")
+            if cid:
+                ids.add(int(cid))
+        return ids
+    except Exception as e:
+        logger.error(f"get_all_chat_ids_from_tasks: {e}")
+        return set()
+
+
+def _all_digest_chats(bot_data: dict) -> list[int]:
+    """
+    Объединяет все источники chat_id для дайджестов:
+    1. DIGEST_CHAT_IDS из env (статические, заданы вручную)
+    2. registered_chats из bot_data (добавляются при входе бота в чат)
+    3. Chat ID из активных задач в Notion (persistent fallback после редеплоя)
+    """
+    combined: set[int] = set(DIGEST_CHAT_IDS)
+    combined.update(bot_data.get("registered_chats", set()))
+    combined.update(get_all_chat_ids_from_tasks())
+    return list(combined)
+
+
 def get_tasks_by_status(status: str) -> list[dict]:
     try:
         res = notion.databases.query(
@@ -683,7 +723,8 @@ async def job_daily_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     yesterday = date.today() - timedelta(days=1)
     summary = await generate_daily_report(yesterday)
 
-    if not summary or not DIGEST_CHAT_IDS:
+    chats = _all_digest_chats(context.bot_data)
+    if not summary or not chats:
         return
 
     header = f"📋 *Отчёт за {yesterday.strftime('%d.%m.%Y')}*\n\n"
@@ -691,7 +732,7 @@ async def job_daily_report(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Telegram ограничивает сообщение 4096 символами — режем если нужно
     chunks = [full_text[i:i+4000] for i in range(0, len(full_text), 4000)]
-    for chat_id in DIGEST_CHAT_IDS:
+    for chat_id in chats:
         for chunk in chunks:
             try:
                 await context.bot.send_message(
@@ -1741,10 +1782,11 @@ async def _build_digest_text(title: str) -> str:
 
 
 async def job_morning_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not DIGEST_CHAT_IDS:
+    chats = _all_digest_chats(context.bot_data)
+    if not chats:
         return
     msg = await _build_digest_text(f"☀️ *Доброе утро! Дайджест на {datetime.now().strftime('%d.%m.%Y')}*")
-    for chat_id in DIGEST_CHAT_IDS:
+    for chat_id in chats:
         try:
             await context.bot.send_message(chat_id=chat_id, text=msg,
                                            parse_mode="Markdown", disable_web_page_preview=True)
@@ -1812,7 +1854,7 @@ async def job_deadline_check(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         # Fallback — шлём в общий дайджест-чат
         if not sent:
-            for cid in DIGEST_CHAT_IDS:
+            for cid in _all_digest_chats(context.bot_data):
                 try:
                     await context.bot.send_message(
                         chat_id=cid, text=text,
@@ -1833,7 +1875,8 @@ async def job_deadline_check(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def job_waiting_check(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not DIGEST_CHAT_IDS:
+    chats = _all_digest_chats(context.bot_data)
+    if not chats:
         return
     stale = get_waiting_stale()
     if not stale:
@@ -1847,7 +1890,7 @@ async def job_waiting_check(context: ContextTypes.DEFAULT_TYPE) -> None:
         since = wd.get("start", "?")
         lines.append(f"  • {name} | {dept} | с {since}")
     msg = "\n".join(lines)
-    for chat_id in DIGEST_CHAT_IDS:
+    for chat_id in chats:
         try:
             await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
         except Exception as e:
@@ -1878,42 +1921,56 @@ async def handle_new_topic(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 # ─────────────────────────────────────────────────────────────────────────────
 async def handle_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Срабатывает когда бот добавлен в группу (MY_CHAT_MEMBER).
-    Telegram Bot API не позволяет получить список существующих топиков —
-    поэтому отправляем инструкцию и регистрируем топики лениво,
-    при первом сообщении в каждом из них.
+    Срабатывает при изменении статуса бота в группе (MY_CHAT_MEMBER):
+    - При добавлении: сохраняем chat_id, отправляем приветствие
+    - При удалении/бане: убираем chat_id из списка рассылки
     """
     result = update.my_chat_member
     if not result:
         return
 
     old_status = result.old_chat_member.status
-    new_status = result.new_chat_member.status
+    new_status  = result.new_chat_member.status
+    chat_id     = result.chat.id
+    chat_title  = result.chat.title or "чат"
 
-    # Бот только что добавлен (был kicked/left → стал member/administrator)
+    # ── Бот удалён / забанен → убираем из списка дайджеста ──────────────────
+    if new_status in ("left", "kicked"):
+        chats: set = context.bot_data.get("registered_chats", set())
+        chats.discard(chat_id)
+        context.bot_data["registered_chats"] = chats
+        logger.info(f"Bot removed from chat {chat_id} ({chat_title}), unregistered")
+        return
+
+    # ── Бот добавлен (был kicked/left → стал member/administrator) ───────────
     if old_status not in ("left", "kicked") or new_status not in ("member", "administrator"):
         return
 
-    chat_id    = result.chat.id
-    chat_title = result.chat.title or "чат"
-    is_forum   = getattr(result.chat, "is_forum", False)
+    # Сохраняем chat_id в bot_data для дайджестов
+    chats: set = context.bot_data.setdefault("registered_chats", set())
+    chats.add(chat_id)
+    logger.info(f"Bot added to chat {chat_id} ({chat_title}), registered for digest")
+
+    is_forum = getattr(result.chat, "is_forum", False)
 
     if is_forum:
         text = (
             f"👋 Привет, *{escape_md(chat_title)}*!\n\n"
             f"Я бот управления задачами пост-продакшена.\n\n"
             f"*Как зарегистрировать топики:*\n"
-            f"Зайди в каждый топик и напиши в нём — я авторегистрирую его.\n"
-            f"Или вручную: `/setup Название` прямо в топике.\n\n"
+            f"Напиши что-нибудь в каждом топике — я авторегистрирую его.\n"
+            f"Или вручную: `/setup Название` в нужном топике.\n\n"
             f"После регистрации доступны команды:\n"
             f"`/t <проект> <выпуск>` — карточка задачи\n"
             f"`/s <проект> <выпуск> <статус>` — сменить статус\n\n"
-            f"📖 /help — полная справка"
+            f"📖 /help — полная справка\n\n"
+            f"_Ежедневный дайджест будет приходить сюда в {DIGEST_HOUR}:00_"
         )
     else:
         text = (
             f"👋 Привет, *{escape_md(chat_title)}*!\n\n"
             f"Я PostProd бот для управления задачами монтажа.\n"
+            f"_Ежедневный дайджест будет приходить сюда в {DIGEST_HOUR}:00_\n\n"
             f"📖 /help — справка по командам"
         )
 
@@ -1923,7 +1980,7 @@ async def handle_bot_added(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             text=text,
             parse_mode="Markdown",
         )
-        logger.info(f"Bot added to chat {chat_id} ({chat_title}), sent welcome")
+        logger.info(f"Welcome message sent to {chat_id} ({chat_title})")
     except Exception as e:
         logger.error(f"handle_bot_added send: {e}")
 
