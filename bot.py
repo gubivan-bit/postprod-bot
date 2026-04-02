@@ -956,17 +956,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not topic:
         return
 
-    # Голосовое → транскрипция
+    # Голосовое → транскрипция (тихая: текст не выводится в чат, только анализируется)
     text = message.text or message.caption or ""
     if message.voice:
-        await message.reply_text("🎙️ Транскрибирую...", message_thread_id=thread_id)
         voice_file = await message.voice.get_file()
         raw = await voice_file.download_as_bytearray()
         text = await gpt_transcribe(bytes(raw))
         if not text:
-            await message.reply_text("❌ Не удалось распознать голосовое", message_thread_id=thread_id)
             return
-        await message.reply_text(f"📝 _{escape_md(text)}_", parse_mode="Markdown", message_thread_id=thread_id)
 
     if not text:
         return
