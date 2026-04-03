@@ -1326,14 +1326,14 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         tasks = get_tasks_by_status(status)
         if tasks:
             lines.append(f"\n{label} — {len(tasks)}")
-            for t in tasks[:7]:
+            for t in tasks:
                 lines.append(fmt_task_line(t))
             total += len(tasks)
 
     overdue = get_overdue()
     if overdue:
         lines.append(f"\n🔥 *Просрочено* — {len(overdue)}")
-        for t in overdue[:5]:
+        for t in overdue:
             lines.append(fmt_deadline_line(t))
 
     lines.append(
@@ -1756,7 +1756,7 @@ async def _build_digest_text(title: str) -> str:
         tasks = get_tasks_by_status(status)
         if tasks:
             lines.append(f"\n{label} — {len(tasks)}")
-            for t in tasks[:5]:
+            for t in tasks:
                 lines.append(fmt_task_line(t))
             total += len(tasks)
 
@@ -1769,7 +1769,7 @@ async def _build_digest_text(title: str) -> str:
     overdue = get_overdue()
     if overdue:
         lines.append(f"\n🔥 *Просрочено* — {len(overdue)}")
-        for t in overdue[:4]:
+        for t in overdue:
             lines.append(fmt_deadline_line(t))
 
     if not total and not due_today and not overdue:
